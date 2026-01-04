@@ -1,0 +1,232 @@
+using System;
+using System.IO;
+using System.Security.Cryptography;
+using System.Text;
+
+namespace SecureFileEncryptor
+{
+    /// <summary>
+    /// A secure file encryption and decryption tool using AES-256 with PBKDF2 key derivation,
+    /// salt for uniqueness, and HMAC-SHA256 for integrity verification.
+    /// This class demonstrates cybersecurity best practices for data protection at rest.
+    /// </summary>
+    public class SecureEncryptor
+    {
+        private const int SaltSize = 16; // 128-bit salt
+        private const int KeySize = 32; // 256-bit key for AES
+        private const int IvSize = 16; // 128-bit IV for AES-CBC
+        private const int HmacKeySize = 32; // 256-bit key for HMAC
+        private const int Iterations = 100000; // PBKDF2 iterations for key stretching
+        private const int HmacSize = 32; // SHA256 produces 256-bit hash
+
+        /// <summary>
+        /// Encrypts a file using the provided password.
+        /// </summary>
+        /// <param name="inputFilePath">Path to the input file to encrypt.</param>
+        /// <param name="outputFilePath">Path to save the encrypted file.</param>
+        /// <param name="password">The password to derive the encryption key from.</param>
+        public void EncryptFile(string inputFilePath, string outputFilePath, string password)
+        {
+            ValidatePaths(inputFilePath, outputFilePath);
+
+            // Generate random salt
+            byte[] salt = GenerateRandomBytes(SaltSize);
+
+            // Derive encryption key and HMAC key from password and salt using PBKDF2
+            (byte[] encryptionKey, byte[] hmacKey) = DeriveKeys(password, salt);
+
+            // Generate random IV
+            byte[] iv = GenerateRandomBytes(IvSize);
+
+            // Read input file
+            byte[] plaintext = File.ReadAllBytes(inputFilePath);
+
+            // Encrypt the plaintext
+            byte[] ciphertext = EncryptData(plaintext, encryptionKey, iv);
+
+            // Compute HMAC for integrity
+            byte[] hmac = ComputeHmac(ciphertext, hmacKey);
+
+            // Write to output: salt + IV + HMAC + ciphertext
+            using (var outputStream = new FileStream(outputFilePath, FileMode.Create))
+            {
+                outputStream.Write(salt, 0, salt.Length);
+                outputStream.Write(iv, 0, iv.Length);
+                outputStream.Write(hmac, 0, hmac.Length);
+                outputStream.Write(ciphertext, 0, ciphertext.Length);
+            }
+
+            Console.WriteLine($"File encrypted successfully: {outputFilePath}");
+        }
+
+        /// <summary>
+        /// Decrypts a file using the provided password.
+        /// </summary>
+        /// <param name="inputFilePath">Path to the encrypted input file.</param>
+        /// <param name="outputFilePath">Path to save the decrypted file.</param>
+        /// <param name="password">The password to derive the decryption key from.</param>
+        public void DecryptFile(string inputFilePath, string outputFilePath, string password)
+        {
+            ValidatePaths(inputFilePath, outputFilePath);
+
+            // Read the encrypted file
+            byte[] encryptedData = File.ReadAllBytes(inputFilePath);
+
+            if (encryptedData.Length < SaltSize + IvSize + HmacSize)
+            {
+                throw new InvalidDataException("Encrypted file is too short or corrupted.");
+            }
+
+            // Extract salt, IV, HMAC, and ciphertext
+            byte[] salt = new byte[SaltSize];
+            byte[] iv = new byte[IvSize];
+            byte[] storedHmac = new byte[HmacSize];
+            byte[] ciphertext = new byte[encryptedData.Length - SaltSize - IvSize - HmacSize];
+
+            Array.Copy(encryptedData, 0, salt, 0, SaltSize);
+            Array.Copy(encryptedData, SaltSize, iv, 0, IvSize);
+            Array.Copy(encryptedData, SaltSize + IvSize, storedHmac, 0, HmacSize);
+            Array.Copy(encryptedData, SaltSize + IvSize + HmacSize, ciphertext, 0, ciphertext.Length);
+
+            // Derive encryption key and HMAC key from password and salt
+            (byte[] encryptionKey, byte[] hmacKey) = DeriveKeys(password, salt);
+
+            // Verify HMAC for integrity
+            byte[] computedHmac = ComputeHmac(ciphertext, hmacKey);
+            if (!CompareByteArrays(storedHmac, computedHmac))
+            {
+                throw new CryptographicException("Integrity check failed: File may have been tampered with.");
+            }
+
+            // Decrypt the ciphertext
+            byte[] plaintext = DecryptData(ciphertext, encryptionKey, iv);
+
+            // Write decrypted data to output
+            File.WriteAllBytes(outputFilePath, plaintext);
+
+            Console.WriteLine($"File decrypted successfully: {outputFilePath}");
+        }
+
+        private void ValidatePaths(string inputFilePath, string outputFilePath)
+        {
+            if (string.IsNullOrEmpty(inputFilePath) || !File.Exists(inputFilePath))
+            {
+                throw new FileNotFoundException("Input file not found.", inputFilePath);
+            }
+
+            if (string.IsNullOrEmpty(outputFilePath))
+            {
+                throw new ArgumentException("Output file path cannot be null or empty.", nameof(outputFilePath));
+            }
+        }
+
+        private byte[] GenerateRandomBytes(int size)
+        {
+            using (var rng = RandomNumberGenerator.Create())
+            {
+                byte[] bytes = new byte[size];
+                rng.GetBytes(bytes);
+                return bytes;
+            }
+        }
+
+        private (byte[] EncryptionKey, byte[] HmacKey) DeriveKeys(string password, byte[] salt)
+        {
+            using (var pbkdf2 = new Rfc2898DeriveBytes(Encoding.UTF8.GetBytes(password), salt, Iterations, HashAlgorithmName.SHA256))
+            {
+                byte[] encryptionKey = pbkdf2.GetBytes(KeySize);
+                byte[] hmacKey = pbkdf2.GetBytes(HmacKeySize);
+                return (encryptionKey, hmacKey);
+            }
+        }
+
+        private byte[] EncryptData(byte[] data, byte[] key, byte[] iv)
+        {
+            using (var aes = Aes.Create())
+            {
+                aes.Key = key;
+                aes.IV = iv;
+                aes.Mode = CipherMode.CBC;
+                aes.Padding = PaddingMode.PKCS7;
+
+                using (var encryptor = aes.CreateEncryptor())
+                using (var memoryStream = new MemoryStream())
+                using (var cryptoStream = new CryptoStream(memoryStream, encryptor, CryptoStreamMode.Write))
+                {
+                    cryptoStream.Write(data, 0, data.Length);
+                    cryptoStream.FlushFinalBlock();
+                    return memoryStream.ToArray();
+                }
+            }
+        }
+
+        private byte[] DecryptData(byte[] data, byte[] key, byte[] iv)
+        {
+            using (var aes = Aes.Create())
+            {
+                aes.Key = key;
+                aes.IV = iv;
+                aes.Mode = CipherMode.CBC;
+                aes.Padding = PaddingMode.PKCS7;
+
+                using (var decryptor = aes.CreateDecryptor())
+                using (var memoryStream = new MemoryStream(data))
+                using (var cryptoStream = new CryptoStream(memoryStream, decryptor, CryptoStreamMode.Read))
+                using (var outputStream = new MemoryStream())
+                {
+                    cryptoStream.CopyTo(outputStream);
+                    return outputStream.ToArray();
+                }
+            }
+        }
+
+        private byte[] ComputeHmac(byte[] data, byte[] key)
+        {
+            using (var hmac = new HMACSHA256(key))
+            {
+                return hmac.ComputeHash(data);
+            }
+        }
+
+        private bool CompareByteArrays(byte[] a, byte[] b)
+        {
+            if (a.Length != b.Length) return false;
+            for (int i = 0; i < a.Length; i++)
+            {
+                if (a[i] != b[i]) return false;
+            }
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Example usage of the SecureEncryptor class.
+    /// </summary>
+    class Program
+    {
+        static void Main(string[] args)
+        {
+            var encryptor = new SecureEncryptor();
+
+            // Example: Encrypt a file
+            try
+            {
+                encryptor.EncryptFile("plain.txt", "encrypted.bin", "StrongPassword123!");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Encryption error: {ex.Message}");
+            }
+
+            // Example: Decrypt the file
+            try
+            {
+                encryptor.DecryptFile("encrypted.bin", "decrypted.txt", "StrongPassword123!");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Decryption error: {ex.Message}");
+            }
+        }
+    }
+}
