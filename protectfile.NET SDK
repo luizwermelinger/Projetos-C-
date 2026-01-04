@@ -1,0 +1,317 @@
+using System;
+using System.IO;
+using System.Security.Cryptography;
+using System.Text;
+using System.Security.AccessControl;
+using System.Security.Principal;
+
+namespace AdvancedFileProtector
+{
+    /// <summary>
+    /// An advanced file protection tool in C# that combines:
+    /// - AES-256 encryption with PBKDF2 key derivation and salt.
+    /// - HMAC-SHA256 for integrity verification.
+    /// - RSA digital signatures for authenticity.
+    /// - File system access control lists (ACL) for permission-based protection.
+    /// - Secure password handling and error management.
+    /// This demonstrates complex cybersecurity practices for protecting files at rest and controlling access.
+    /// </summary>
+    public class FileProtector
+    {
+        private const int SaltSize = 16; // 128-bit salt
+        private const int KeySize = 32; // 256-bit key for AES
+        private const int IvSize = 16; // 128-bit IV for AES-CBC
+        private const int HmacKeySize = 32; // 256-bit key for HMAC
+        private const int Iterations = 100000; // PBKDF2 iterations for key stretching
+        private const int HmacSize = 32; // SHA256 produces 256-bit hash
+        private const int RsaKeySize = 2048; // RSA key size for digital signatures
+
+        /// <summary>
+        /// Protects a file by encrypting it, signing it, and setting restrictive ACL permissions.
+        /// </summary>
+        /// <param name="inputFilePath">Path to the input file to protect.</param>
+        /// <param name="outputFilePath">Path to save the protected file.</param>
+        /// <param name="password">The password for encryption key derivation.</param>
+        /// <param name="privateKey">RSA private key for signing (in XML format).</param>
+        /// <param name="allowedUser">Windows username to grant read access (optional).</param>
+        public void ProtectFile(string inputFilePath, string outputFilePath, string password, string privateKey, string allowedUser = null)
+        {
+            ValidatePaths(inputFilePath, outputFilePath);
+
+            // Generate random salt and IV
+            byte[] salt = GenerateRandomBytes(SaltSize);
+            byte[] iv = GenerateRandomBytes(IvSize);
+
+            // Derive keys
+            (byte[] encryptionKey, byte[] hmacKey) = DeriveKeys(password, salt);
+
+            // Read plaintext
+            byte[] plaintext = File.ReadAllBytes(inputFilePath);
+
+            // Encrypt
+            byte[] ciphertext = EncryptData(plaintext, encryptionKey, iv);
+
+            // Compute HMAC
+            byte[] hmac = ComputeHmac(ciphertext, hmacKey);
+
+            // Sign the ciphertext with RSA
+            byte[] signature = SignData(ciphertext, privateKey);
+
+            // Write protected file: salt + IV + HMAC + signature length + signature + ciphertext
+            using (var outputStream = new FileStream(outputFilePath, FileMode.Create))
+            {
+                outputStream.Write(salt, 0, salt.Length);
+                outputStream.Write(iv, 0, iv.Length);
+                outputStream.Write(hmac, 0, hmac.Length);
+
+                byte[] sigLengthBytes = BitConverter.GetBytes(signature.Length);
+                outputStream.Write(sigLengthBytes, 0, sizeof(int));
+                outputStream.Write(signature, 0, signature.Length);
+
+                outputStream.Write(ciphertext, 0, ciphertext.Length);
+            }
+
+            // Set restrictive ACL
+            SetFilePermissions(outputFilePath, allowedUser);
+
+            Console.WriteLine($"File protected successfully: {outputFilePath}");
+        }
+
+        /// <summary>
+        /// Unprotects a file by verifying signature, integrity, decrypting, and optionally resetting permissions.
+        /// </summary>
+        /// <param name="inputFilePath">Path to the protected input file.</param>
+        /// <param name="outputFilePath">Path to save the unprotected file.</param>
+        /// <param name="password">The password for decryption key derivation.</param>
+        /// <param name="publicKey">RSA public key for signature verification (in XML format).</param>
+        public void UnprotectFile(string inputFilePath, string outputFilePath, string password, string publicKey)
+        {
+            ValidatePaths(inputFilePath, outputFilePath);
+
+            // Read protected data
+            byte[] protectedData = File.ReadAllBytes(inputFilePath);
+
+            if (protectedData.Length < SaltSize + IvSize + HmacSize + sizeof(int))
+            {
+                throw new InvalidDataException("Protected file is too short or corrupted.");
+            }
+
+            // Extract components
+            byte[] salt = new byte[SaltSize];
+            byte[] iv = new byte[IvSize];
+            byte[] storedHmac = new byte[HmacSize];
+            int offset = 0;
+
+            Array.Copy(protectedData, offset, salt, 0, SaltSize); offset += SaltSize;
+            Array.Copy(protectedData, offset, iv, 0, IvSize); offset += IvSize;
+            Array.Copy(protectedData, offset, storedHmac, 0, HmacSize); offset += HmacSize;
+
+            int sigLength = BitConverter.ToInt32(protectedData, offset); offset += sizeof(int);
+            byte[] storedSignature = new byte[sigLength];
+            Array.Copy(protectedData, offset, storedSignature, 0, sigLength); offset += sigLength;
+
+            byte[] ciphertext = new byte[protectedData.Length - offset];
+            Array.Copy(protectedData, offset, ciphertext, 0, ciphertext.Length);
+
+            // Derive keys
+            (byte[] encryptionKey, byte[] hmacKey) = DeriveKeys(password, salt);
+
+            // Verify HMAC
+            byte[] computedHmac = ComputeHmac(ciphertext, hmacKey);
+            if (!CompareByteArrays(storedHmac, computedHmac))
+            {
+                throw new CryptographicException("Integrity check failed: File may have been tampered with.");
+            }
+
+            // Verify signature
+            if (!VerifySignature(ciphertext, storedSignature, publicKey))
+            {
+                throw new CryptographicException("Signature verification failed: Authenticity not confirmed.");
+            }
+
+            // Decrypt
+            byte[] plaintext = DecryptData(ciphertext, encryptionKey, iv);
+
+            // Write unprotected file
+            File.WriteAllBytes(outputFilePath, plaintext);
+
+            Console.WriteLine($"File unprotected successfully: {outputFilePath}");
+        }
+
+        /// <summary>
+        /// Generates RSA key pair in XML format.
+        /// </summary>
+        /// <returns>Tuple of (publicKeyXml, privateKeyXml).</returns>
+        public static (string PublicKey, string PrivateKey) GenerateRsaKeyPair()
+        {
+            using (var rsa = RSA.Create(RsaKeySize))
+            {
+                return (rsa.ToXmlString(false), rsa.ToXmlString(true));
+            }
+        }
+
+        private void ValidatePaths(string inputFilePath, string outputFilePath)
+        {
+            if (string.IsNullOrEmpty(inputFilePath) || !File.Exists(inputFilePath))
+            {
+                throw new FileNotFoundException("Input file not found.", inputFilePath);
+            }
+
+            if (string.IsNullOrEmpty(outputFilePath))
+            {
+                throw new ArgumentException("Output file path cannot be null or empty.", nameof(outputFilePath));
+            }
+        }
+
+        private byte[] GenerateRandomBytes(int size)
+        {
+            using (var rng = RandomNumberGenerator.Create())
+            {
+                byte[] bytes = new byte[size];
+                rng.GetBytes(bytes);
+                return bytes;
+            }
+        }
+
+        private (byte[] EncryptionKey, byte[] HmacKey) DeriveKeys(string password, byte[] salt)
+        {
+            using (var pbkdf2 = new Rfc2898DeriveBytes(Encoding.UTF8.GetBytes(password), salt, Iterations, HashAlgorithmName.SHA256))
+            {
+                byte[] encryptionKey = pbkdf2.GetBytes(KeySize);
+                byte[] hmacKey = pbkdf2.GetBytes(HmacKeySize);
+                return (encryptionKey, hmacKey);
+            }
+        }
+
+        private byte[] EncryptData(byte[] data, byte[] key, byte[] iv)
+        {
+            using (var aes = Aes.Create())
+            {
+                aes.Key = key;
+                aes.IV = iv;
+                aes.Mode = CipherMode.CBC;
+                aes.Padding = PaddingMode.PKCS7;
+
+                using (var encryptor = aes.CreateEncryptor())
+                using (var memoryStream = new MemoryStream())
+                using (var cryptoStream = new CryptoStream(memoryStream, encryptor, CryptoStreamMode.Write))
+                {
+                    cryptoStream.Write(data, 0, data.Length);
+                    cryptoStream.FlushFinalBlock();
+                    return memoryStream.ToArray();
+                }
+            }
+        }
+
+        private byte[] DecryptData(byte[] data, byte[] key, byte[] iv)
+        {
+            using (var aes = Aes.Create())
+            {
+                aes.Key = key;
+                aes.IV = iv;
+                aes.Mode = CipherMode.CBC;
+                aes.Padding = PaddingMode.PKCS7;
+
+                using (var decryptor = aes.CreateDecryptor())
+                using (var memoryStream = new MemoryStream(data))
+                using (var cryptoStream = new CryptoStream(memoryStream, decryptor, CryptoStreamMode.Read))
+                using (var outputStream = new MemoryStream())
+                {
+                    cryptoStream.CopyTo(outputStream);
+                    return outputStream.ToArray();
+                }
+            }
+        }
+
+        private byte[] ComputeHmac(byte[] data, byte[] key)
+        {
+            using (var hmac = new HMACSHA256(key))
+            {
+                return hmac.ComputeHash(data);
+            }
+        }
+
+        private byte[] SignData(byte[] data, string privateKeyXml)
+        {
+            using (var rsa = RSA.Create())
+            {
+                rsa.FromXmlString(privateKeyXml);
+                return rsa.SignData(data, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+            }
+        }
+
+        private bool VerifySignature(byte[] data, byte[] signature, string publicKeyXml)
+        {
+            using (var rsa = RSA.Create())
+            {
+                rsa.FromXmlString(publicKeyXml);
+                return rsa.VerifyData(data, signature, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+            }
+        }
+
+        private bool CompareByteArrays(byte[] a, byte[] b)
+        {
+            if (a.Length != b.Length) return false;
+            for (int i = 0; i < a.Length; i++)
+            {
+                if (a[i] != b[i]) return false;
+            }
+            return true;
+        }
+
+        private void SetFilePermissions(string filePath, string allowedUser)
+        {
+            var fileInfo = new FileInfo(filePath);
+            var security = fileInfo.GetAccessControl();
+
+            // Remove inheritance and existing rules
+            security.SetAccessRuleProtection(true, false);
+
+            // Grant full control to current user
+            var currentUser = WindowsIdentity.GetCurrent().User;
+            security.AddAccessRule(new FileSystemAccessRule(currentUser, FileSystemRights.FullControl, AccessControlType.Allow));
+
+            // If specified, grant read access to allowed user
+            if (!string.IsNullOrEmpty(allowedUser))
+            {
+                security.AddAccessRule(new FileSystemAccessRule(allowedUser, FileSystemRights.Read, AccessControlType.Allow));
+            }
+
+            fileInfo.SetAccessControl(security);
+        }
+    }
+
+    /// <summary>
+    /// Example usage of the FileProtector class.
+    /// </summary>
+    class Program
+    {
+        static void Main(string[] args)
+        {
+            var protector = new FileProtector();
+
+            // Generate RSA key pair
+            var (publicKey, privateKey) = FileProtector.GenerateRsaKeyPair();
+
+            // Example: Protect a file
+            try
+            {
+                protector.ProtectFile("plain.txt", "protected.bin", "StrongPassword123!", privateKey, "AllowedUser");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Protection error: {ex.Message}");
+            }
+
+            // Example: Unprotect the file
+            try
+            {
+                protector.UnprotectFile("protected.bin", "unprotected.txt", "StrongPassword123!", publicKey);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Unprotection error: {ex.Message}");
+            }
+        }
+    }
+}
